@@ -192,10 +192,17 @@ target_include_directories(Baikal PUBLIC "${Baikal_SOURCE_DIR}/Baikal")
 target_link_libraries(Baikal PUBLIC RadeonRays)
 
 # Add 'treat warnings as errors' flag and 'Wall' flag on Unix
+# BAIKAL_WARNINGS_AS_ERRORS can be turned OFF for newer compilers/SDKs (e.g. CI)
+option(BAIKAL_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 if (WIN32)
-    target_compile_options(Baikal PUBLIC /WX)
+    if (BAIKAL_WARNINGS_AS_ERRORS)
+        target_compile_options(Baikal PUBLIC /WX)
+    endif ()
 elseif (UNIX)
-    target_compile_options(Baikal PUBLIC -Wall -Werror)
+    target_compile_options(Baikal PUBLIC -Wall)
+    if (BAIKAL_WARNINGS_AS_ERRORS)
+        target_compile_options(Baikal PUBLIC -Werror)
+    endif ()
 endif (WIN32)
 
 # Add symbolic link from binary to Baikal/Kernels directory

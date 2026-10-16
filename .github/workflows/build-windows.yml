@@ -1,0 +1,125 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to attach the zip to a GitHub Release on tag pushes
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    env:
+      BUILD_DIR: build
+      PKG_NAME: Baikal-win64
+      # Modern Khronos headers default to OpenCL 3.0 and mark 1.x APIs deprecated.
+      # Baikal/RadeonRays target OpenCL 1.2 and still call some 1.1 APIs (clCreateImage2D).
+      CXXFLAGS: /DCL_TARGET_OPENCL_VERSION=120 /DCL_USE_DEPRECATED_OPENCL_1_1_APIS /DCL_USE_DEPRECATED_OPENCL_1_2_APIS
+      CFLAGS: /DCL_TARGET_OPENCL_VERSION=120 /DCL_USE_DEPRECATED_OPENCL_1_1_APIS /DCL_USE_DEPRECATED_OPENCL_1_2_APIS
+
+    steps:
+      - name: Checkout (with RadeonRays submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Kernel stringify scripts (RadeonRays/CLW) run at build time. README says Python 2.7,
+      # but the scripts are Python 3 compatible and FindPythonInterp(2.7) accepts 3.x.
+      - name: Set up Python
+        id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The repo bundles Windows x64 OIIO/GLEW/GLFW in 3rdparty/, but no OpenCL SDK.
+      # Khronos headers + ICD loader import lib from vcpkg; at runtime the GPU driver's OpenCL.dll is used.
+      - name: Install OpenCL SDK (vcpkg)
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install opencl:x64-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" -replace '\\','/'
+          "OPENCL_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B $env:BUILD_DIR -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
+            -DBAIKAL_ENABLE_STANDALONE=ON `
+            -DBAIKAL_ENABLE_IO=ON `
+            -DBAIKAL_ENABLE_TESTS=OFF `
+            -DBAIKAL_ENABLE_DATAGENERATOR=OFF `
+            -DBAIKAL_ENABLE_RPR=OFF `
+            -DBAIKAL_WARNINGS_AS_ERRORS=OFF `
+            -DPYTHON_EXECUTABLE="${{ steps.py.outputs.python-path }}" `
+            -DOpenCL_INCLUDE_DIR="$env:OPENCL_ROOT/include" `
+            -DOpenCL_LIBRARY="$env:OPENCL_ROOT/lib/OpenCL.lib"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build $env:BUILD_DIR --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 3rdparty/oiio/bin/x64/OpenImageIO.dll was built with VS2012 and imports MSVCP110/MSVCR110.
+      - name: Ensure VC++ 2012 runtime is available to bundle
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "$env:WINDIR\System32\msvcp110.dll")) {
+            choco install vcredist2012 -y --no-progress
+          }
+          if (-not (Test-Path "$env:WINDIR\System32\msvcp110.dll")) { throw "msvcp110.dll still missing after vcredist2012 install" }
+
+      # Runtime paths in the code are relative to the working directory
+      # ("../Resources", "../Baikal/Kernels/CL", "../BaikalStandalone/Kernels/GLSL", "cache"),
+      # so the package mirrors the repo layout with the exe one level down in bin/.
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "$env:BUILD_DIR/bin/Release"
+          $pkg = "dist/$env:PKG_NAME"
+          New-Item -ItemType Directory -Force -Path "$pkg/bin/cache", "$pkg/Output", "$pkg/Baikal/Kernels", "$pkg/BaikalStandalone" | Out-Null
+
+          Copy-Item "$out/BaikalStandalone.exe" "$pkg/bin/"
+          Get-ChildItem "$out/*.dll" | Where-Object { $_.Name -ne 'OpenImageIOD.dll' } | Copy-Item -Destination "$pkg/bin/"
+
+          Copy-Item -Recurse "Resources"                 "$pkg/Resources"
+          Copy-Item -Recurse "Baikal/Kernels/CL"         "$pkg/Baikal/Kernels/CL"
+          Copy-Item -Recurse "BaikalStandalone/Kernels"  "$pkg/BaikalStandalone/Kernels"
+
+          # App-local MSVC runtimes: VS2012 (OIIO) + VS2015-2022 (everything else)
+          foreach ($dll in 'msvcp110.dll','msvcr110.dll','msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll') {
+            $src = "$env:WINDIR\System32\$dll"
+            if (Test-Path $src) { Copy-Item $src "$pkg/bin/" } else { Write-Warning "$dll not found, not bundled" }
+          }
+
+          Copy-Item "LICENSE.txt", "README.md" "$pkg/"
+          @(
+            '@echo off'
+            'cd /d "%~dp0bin"'
+            'BaikalStandalone.exe %*'
+          ) | Set-Content -Encoding ascii "$pkg/BaikalStandalone.bat"
+
+          Write-Host "Package contents:"
+          Get-ChildItem -Recurse "$pkg/bin" | Select-Object -ExpandProperty FullName
+
+          Compress-Archive -Path "$pkg/*" -DestinationPath "dist/$env:PKG_NAME.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: dist/${{ env.PKG_NAME }}
+          if-no-files-found: error
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ env.PKG_NAME }}.zip
